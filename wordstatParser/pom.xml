@@ -12,6 +12,7 @@
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <kotlin.version>1.9.22</kotlin.version>
     </properties>
 
     <dependencies>
@@ -43,6 +44,12 @@
             <scope>compile</scope>
         </dependency>
         <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.5.1</version>
+            <scope>compile</scope>
+        </dependency>
+        <dependency>
             <groupId>org.openjfx</groupId>
             <artifactId>javafx-controls</artifactId>
             <version>21</version> <!-- Укажите вашу версию JavaFX -->
@@ -54,6 +61,17 @@
             <artifactId>javafx-fxml</artifactId>
             <version>21</version>
         </dependency>
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-stdlib-jdk8</artifactId>
+            <version>${kotlin.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-test</artifactId>
+            <version>${kotlin.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -64,7 +82,70 @@
             <version>0.0.8</version>
             <configuration>
                 <mainClass>org.paring.Main</mainClass>
+                <jvmArgs>
+                    <jvmArg>-Dprism.order=sw</jvmArg>
+                    <jvmArg>-Dprism.forceGPU=false</jvmArg>
+                    <jvmArg>-Dquantum.multithreaded=false</jvmArg>
+                </jvmArgs>
             </configuration>
+        </plugin>
+        <plugin>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-maven-plugin</artifactId>
+            <version>${kotlin.version}</version>
+            <executions>
+                <execution>
+                    <id>compile</id>
+                    <phase>compile</phase>
+                    <goals>
+                        <goal>compile</goal>
+                    </goals>
+                    <configuration>
+                        <sourceDirs>
+                            <source>src/main/java</source>
+                            <source>target/generated-sources/annotations</source>
+                        </sourceDirs>
+                    </configuration>
+                </execution>
+                <execution>
+                    <id>test-compile</id>
+                    <phase>test-compile</phase>
+                    <goals>
+                        <goal>test-compile</goal>
+                    </goals>
+                </execution>
+            </executions>
+            <configuration>
+                <jvmTarget>${maven.compiler.target}</jvmTarget>
+            </configuration>
+        </plugin>
+        <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <executions>
+                <execution>
+                    <id>default-compile</id>
+                    <phase>none</phase>
+                </execution>
+                <execution>
+                    <id>default-testCompile</id>
+                    <phase>none</phase>
+                </execution>
+                <execution>
+                    <id>compile</id>
+                    <phase>compile</phase>
+                    <goals>
+                        <goal>compile</goal>
+                    </goals>
+                </execution>
+                <execution>
+                    <id>testCompile</id>
+                    <phase>test-compile</phase>
+                    <goals>
+                        <goal>testCompile</goal>
+                    </goals>
+                </execution>
+            </executions>
         </plugin>
     </plugins>
 </build>

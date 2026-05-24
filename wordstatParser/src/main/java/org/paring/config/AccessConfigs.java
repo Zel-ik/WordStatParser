@@ -14,6 +14,11 @@ public class AccessConfigs {
     private String authToken;
     private String yandexUri;
     private String dynamicsUri;
+
+    public void setAuthToken(String authToken) {
+        this.authToken = authToken;
+    }
+
     public void init () {
         Properties prop = new Properties();
 
