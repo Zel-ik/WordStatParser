@@ -10,6 +10,7 @@ import java.util.Properties;
 @Slf4j
 @Getter
 public class AccessConfigs {
+    private static final String YANDEX_AUTH_TOKEN_ENV = "YANDEX_AUTH_TOKEN";
 
     private String authToken;
     private String yandexUri;
@@ -29,12 +30,22 @@ public class AccessConfigs {
             }
             prop.load(input);
 
-            authToken = prop.getProperty("yandex.auth.token");
+            authToken = resolveAuthToken(prop);
             yandexUri = prop.getProperty("yandex.uri");
             dynamicsUri = prop.getProperty("yandex.uri.dynamics");
 
         } catch (IOException ex) {
             log.error("ошибка при чтении application.properties");
         }
+    }
+
+    private String resolveAuthToken(Properties properties) {
+        String envToken = System.getenv(YANDEX_AUTH_TOKEN_ENV);
+        if (envToken != null && !envToken.trim().isBlank()) {
+            return envToken.trim();
+        }
+
+        String propertyToken = properties.getProperty("yandex.auth.token");
+        return propertyToken == null ? "" : propertyToken.trim();
     }
 }

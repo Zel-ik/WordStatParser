@@ -3,6 +3,7 @@ package org.paring.service;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.hssf.usermodel.HSSFWorkbook;
 import org.apache.poi.ss.usermodel.CellStyle;
+import org.apache.poi.ss.usermodel.DataFormatter;
 import org.apache.poi.ss.usermodel.Font;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
@@ -40,12 +41,17 @@ public class ExcelService {
             int maxBlocks = rows.stream().mapToInt(row -> row.getBlocks().size()).max().orElse(0);
             int columnIndex = 1;
 
+            for (int resultIndex = 0; resultIndex < DEFAULT_PERIOD_COUNT; resultIndex++) {
+                headerRow.createCell(columnIndex).setCellValue(resolveFullNamePeriodHeader(rows, resultIndex));
+                columnIndex++;
+            }
+
             for (int blockIndex = 0; blockIndex < maxBlocks; blockIndex++) {
                 headerRow.createCell(columnIndex).setCellValue(buildPhraseHeader(blockIndex + 1));
                 headerRow.getCell(columnIndex).setCellStyle(boldStyle);
                 columnIndex++;
 
-                for (int resultIndex = 0; resultIndex < 3; resultIndex++) {
+                for (int resultIndex = 0; resultIndex < DEFAULT_PERIOD_COUNT; resultIndex++) {
                     headerRow.createCell(columnIndex).setCellValue(resolvePeriodHeader(rows, blockIndex, resultIndex));
                     columnIndex++;
                 }
@@ -58,13 +64,23 @@ public class ExcelService {
                 dataRow.createCell(0).setCellValue(workbookRow.getUniversityName());
 
                 int dataColumnIndex = 1;
+                for (int resultIndex = 0; resultIndex < DEFAULT_PERIOD_COUNT; resultIndex++) {
+                    if (resultIndex < workbookRow.getFullNameResults().size()) {
+                        ResponseToSaveToExcelDTO result = workbookRow.getFullNameResults().get(resultIndex);
+                        dataRow.createCell(dataColumnIndex).setCellValue(
+                                result.getCountSum() == null ? "нет" : String.valueOf(result.getCountSum())
+                        );
+                    }
+                    dataColumnIndex++;
+                }
+
                 for (int blockIndex = 0; blockIndex < maxBlocks; blockIndex++) {
                     if (blockIndex < workbookRow.getBlocks().size()) {
                         WorkbookBlockResult block = workbookRow.getBlocks().get(blockIndex);
                         dataRow.createCell(dataColumnIndex).setCellValue(block.getPhrase());
                         dataColumnIndex++;
 
-                        for (int resultIndex = 0; resultIndex < 3; resultIndex++) {
+                        for (int resultIndex = 0; resultIndex < DEFAULT_PERIOD_COUNT; resultIndex++) {
                             if (resultIndex < block.getResults().size()) {
                                 ResponseToSaveToExcelDTO result = block.getResults().get(resultIndex);
                                 dataRow.createCell(dataColumnIndex).setCellValue(
@@ -74,7 +90,7 @@ public class ExcelService {
                             dataColumnIndex++;
                         }
                     } else {
-                        dataColumnIndex += 4;
+                        dataColumnIndex += DEFAULT_PERIOD_COUNT + 1;
                     }
                 }
             }
@@ -127,6 +143,97 @@ public class ExcelService {
         }
     }
 
+    public void updateSheetPeriodHeaders(Path path, String sheetName, List<String> dateRanges) {
+        if (dateRanges.isEmpty()) {
+            return;
+        }
+
+        try {
+            Workbook workbook;
+            try (InputStream inputStream = Files.newInputStream(path)) {
+                workbook = WorkbookFactory.create(inputStream);
+            }
+
+            try (workbook) {
+                Sheet sheet = workbook.getSheet(sheetName);
+                if (sheet == null) {
+                    throw new IllegalStateException("Не удалось найти лист \"" + sheetName + "\" для обновления периодов.");
+                }
+
+                Row headerRow = findTemplateHeaderRow(sheet);
+                if (headerRow == null) {
+                    throw new IllegalStateException("Не удалось найти строку заголовков на листе \"" + sheetName + "\".");
+                }
+
+                for (int columnIndex = 0; columnIndex < headerRow.getLastCellNum(); columnIndex++) {
+                    String header = new DataFormatter().formatCellValue(headerRow.getCell(columnIndex)).toLowerCase();
+                    if (!header.contains("кол-во")) {
+                        continue;
+                    }
+
+                    int periodIndex = resolvePeriodIndex(headerRow, columnIndex);
+                    if (periodIndex >= 0 && periodIndex < dateRanges.size()) {
+                        headerRow.createCell(columnIndex).setCellValue(buildPeriodHeader(dateRanges.get(periodIndex)));
+                    }
+                }
+
+                try (FileOutputStream outputStream = new FileOutputStream(path.toFile())) {
+                    workbook.write(outputStream);
+                }
+            }
+        } catch (IOException e) {
+            log.error("Ошибка при обновлении периодов листа\n" + e.getMessage());
+            throw new IllegalStateException("Не удалось обновить периоды листа: " + e.getMessage(), e);
+        }
+    }
+
+    private Row findTemplateHeaderRow(Sheet sheet) {
+        DataFormatter formatter = new DataFormatter();
+        int maxRow = Math.min(sheet.getLastRowNum(), 10);
+        for (int rowIndex = sheet.getFirstRowNum(); rowIndex <= maxRow; rowIndex++) {
+            Row row = sheet.getRow(rowIndex);
+            if (row == null) {
+                continue;
+            }
+
+            boolean hasFullName = false;
+            boolean hasPhrase = false;
+            for (org.apache.poi.ss.usermodel.Cell cell : row) {
+                String value = formatter.formatCellValue(cell).toLowerCase();
+                if (value.contains("полное")) {
+                    hasFullName = true;
+                }
+                if (value.contains("сокращ")) {
+                    hasPhrase = true;
+                }
+            }
+
+            if (hasFullName && hasPhrase) {
+                return row;
+            }
+        }
+        return null;
+    }
+
+    private int resolvePeriodIndex(Row headerRow, int columnIndex) {
+        int resultIndex = 0;
+        DataFormatter formatter = new DataFormatter();
+        for (int currentColumn = 0; currentColumn <= columnIndex; currentColumn++) {
+            String header = formatter.formatCellValue(headerRow.getCell(currentColumn)).toLowerCase();
+            if (header.contains("сокращ")) {
+                resultIndex = 0;
+                continue;
+            }
+            if (header.contains("кол-во")) {
+                if (currentColumn == columnIndex) {
+                    return resultIndex;
+                }
+                resultIndex++;
+            }
+        }
+        return -1;
+    }
+
     private void createTemplateHeader(Sheet sheet) {
         Row headerRow = sheet.createRow(0);
         increaseRowHeight(headerRow);
@@ -136,16 +243,21 @@ public class ExcelService {
         headerRow.createCell(0).setCellValue("Полное название учебного заведения");
         headerRow.getCell(0).setCellStyle(boldStyle);
 
-        headerRow.createCell(1).setCellValue(buildPhraseHeader(1));
-        headerRow.getCell(1).setCellStyle(boldStyle);
-
         for (int i = 0; i < DEFAULT_PERIOD_COUNT; i++) {
-            headerRow.createCell(i + 2).setCellValue("кол-во за период");
+            headerRow.createCell(i + 1).setCellValue("кол-во за период");
         }
 
-        for (int i = 0; i < DEFAULT_PERIOD_COUNT + 2; i++) {
+        int phraseColumnIndex = DEFAULT_PERIOD_COUNT + 1;
+        headerRow.createCell(phraseColumnIndex).setCellValue(buildPhraseHeader(1));
+        headerRow.getCell(phraseColumnIndex).setCellStyle(boldStyle);
+
+        for (int i = 0; i < DEFAULT_PERIOD_COUNT; i++) {
+            headerRow.createCell(phraseColumnIndex + i + 1).setCellValue("кол-во за период");
+        }
+
+        for (int i = 0; i < DEFAULT_PERIOD_COUNT * 2 + 2; i++) {
             sheet.autoSizeColumn(i);
-            increaseColumnWidth(sheet, i, i == 0 || i == 1 ? 1.8 : 1.3);
+            increaseColumnWidth(sheet, i, isPhraseLikeColumn(i) || i == 0 ? 1.8 : 1.3);
         }
     }
 
@@ -154,14 +266,28 @@ public class ExcelService {
             return true;
         }
 
-        int currentColumn = 1;
+        int currentColumn = DEFAULT_PERIOD_COUNT + 1;
         for (int blockIndex = 0; blockIndex < maxBlocks; blockIndex++) {
             if (currentColumn == columnIndex) {
                 return true;
             }
-            currentColumn += 4;
+            currentColumn += DEFAULT_PERIOD_COUNT + 1;
         }
         return false;
+    }
+
+    private boolean isPhraseLikeColumn(int columnIndex) {
+        return columnIndex >= DEFAULT_PERIOD_COUNT + 1
+                && (columnIndex - (DEFAULT_PERIOD_COUNT + 1)) % (DEFAULT_PERIOD_COUNT + 1) == 0;
+    }
+
+    private String resolveFullNamePeriodHeader(List<WorkbookRowResult> rows, int resultIndex) {
+        for (WorkbookRowResult row : rows) {
+            if (resultIndex < row.getFullNameResults().size()) {
+                return buildPeriodHeader(row.getFullNameResults().get(resultIndex).getDate());
+            }
+        }
+        return "кол-во за период";
     }
 
     private String resolvePeriodHeader(List<WorkbookRowResult> rows, int blockIndex, int resultIndex) {

@@ -27,19 +27,28 @@ import org.paring.model.WorkbookDraftRowInput;
 import org.paring.model.WorkbookRowResult;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -49,11 +58,19 @@ public class RequestService {
     private static final DateTimeFormatter INPUT_MONTH_FORMATTER = DateTimeFormatter.ofPattern("MM.yyyy");
     private static final DateTimeFormatter OUTPUT_DATE_FORMATTER = DateTimeFormatter.ofPattern("dd.MM.yyyy");
     private static final Pattern HEADER_DATE_RANGE_PATTERN = Pattern.compile("(\\d{2}\\.\\d{2}\\.\\d{2,4}).*?(\\d{2}\\.\\d{2}\\.\\d{2,4})");
+    private static final String COUNTER_DATE_PROPERTY = "date";
+    private static final String DAILY_REQUEST_LIMIT_PROPERTY = "dailyRequestLimit";
+    private static final String REQUESTS_SENT_TODAY_PROPERTY = "requestsSentToday";
 
     private final AccessConfigs accessConfigs;
     private final ExcelService excelService;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
+    private final Path requestCounterStatePath;
+    private final ScheduledExecutorService requestCounterResetExecutor;
+    private LocalDate requestCounterDate = LocalDate.now();
+    private int dailyRequestLimit = 1000;
+    private int requestsSentToday;
 
     public RequestService(AccessConfigs accessConfigs, ExcelService excelService) {
         this.accessConfigs = accessConfigs;
@@ -63,6 +80,18 @@ public class RequestService {
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
         this.objectMapper = new ObjectMapper();
+        this.requestCounterStatePath = Paths.get(
+                System.getProperty("user.home"),
+                ".wordstat-parser",
+                "request-counter.properties"
+        );
+        loadRequestCounterState();
+        this.requestCounterResetExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "wordstat-request-counter-reset-thread");
+            thread.setDaemon(true);
+            return thread;
+        });
+        scheduleDailyRequestCounterReset();
     }
 
     public void updateAuthToken(String authToken) {
@@ -73,6 +102,35 @@ public class RequestService {
         accessConfigs.setAuthToken(normalizedToken);
     }
 
+    public synchronized int getDailyRequestLimit() {
+        resetRequestCounterIfNeeded();
+        return dailyRequestLimit;
+    }
+
+    public synchronized void updateDailyRequestLimit(int dailyRequestLimit) {
+        if (dailyRequestLimit < 1) {
+            throw new IllegalArgumentException("Максимальное количество запросов должно быть больше нуля.");
+        }
+        resetRequestCounterIfNeeded();
+        if (requestsSentToday > dailyRequestLimit) {
+            throw new IllegalArgumentException(
+                    "Новый лимит меньше уже отправленных сегодня запросов: " + requestsSentToday + "."
+            );
+        }
+        this.dailyRequestLimit = dailyRequestLimit;
+        saveRequestCounterState();
+    }
+
+    public synchronized int getRequestsSentToday() {
+        resetRequestCounterIfNeeded();
+        return requestsSentToday;
+    }
+
+    public synchronized int getRemainingRequestsToday() {
+        resetRequestCounterIfNeeded();
+        return Math.max(0, dailyRequestLimit - requestsSentToday);
+    }
+
     public void createWorkbook(List<WorkbookDraftRowInput> rows, Path outputPath) {
         try {
             List<WorkbookRowResult> workbookRows = new ArrayList<>();
@@ -80,6 +138,16 @@ public class RequestService {
             for (WorkbookDraftRowInput rowInput : rows) {
                 WorkbookRowResult workbookRow = new WorkbookRowResult();
                 workbookRow.setUniversityName(rowInput.getUniversityName());
+
+                if (!rowInput.getBlocks().isEmpty()) {
+                    PhraseBlockInput firstBlock = rowInput.getBlocks().get(0);
+                    for (DateRangeInput dateRange : firstBlock.getDateRanges()) {
+                        UniResponse uniResponse = sendWordStatRequest(rowInput.getUniversityName(), dateRange);
+                        workbookRow.getFullNameResults().add(
+                                buildResponseDto(rowInput.getUniversityName(), rowInput.getUniversityName(), dateRange, uniResponse)
+                        );
+                    }
+                }
 
                 for (PhraseBlockInput block : rowInput.getBlocks()) {
                     WorkbookBlockResult blockResult = new WorkbookBlockResult();
@@ -122,6 +190,17 @@ public class RequestService {
 
     public String addSheetToWorkbook(Path path, String sheetName) {
         return excelService.addSheet(path, sheetName);
+    }
+
+    public void updateSheetPeriods(Path path, String sheetName, List<DateRangeInput> dateRanges) {
+        List<String> normalizedDateRanges = new ArrayList<>();
+        for (DateRangeInput dateRange : dateRanges) {
+            normalizedDateRanges.add(
+                    normalizeToFirstDayOfMonth(dateRange.getDateFrom()) + " - " +
+                            normalizeToLastDayOfMonth(dateRange.getDateTo())
+            );
+        }
+        excelService.updateSheetPeriodHeaders(path, sheetName, normalizedDateRanges);
     }
 
     public List<ExcelPreviewResult> refillBlock(Path path, ExcelPreviewUniversity university, ExcelPreviewBlock block) {
@@ -180,19 +259,151 @@ public class RequestService {
     }
 
     private UniResponse sendWordStatRequest(String phrase, DateRangeInput dateRange) throws IOException, InterruptedException {
+        registerWordStatRequest();
+
         UniRequest uniRequest = createRequest(phrase, dateRange);
         String jsonBody = objectMapper.writeValueAsString(uniRequest);
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("https:/" + accessConfigs.getYandexUri() + accessConfigs.getDynamicsUri()))
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + accessConfigs.getAuthToken())
+                .header("Authorization", buildAuthorizationHeader())
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                 .timeout(Duration.ofSeconds(30))
                 .build();
 
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() == 429 || isQuotaLimitExceeded(response.body())) {
+            exhaustDailyRequestLimit();
+            log.warn("Wordstat quota limit exceeded. Response status: {}, body: {}", response.statusCode(), response.body());
+            throw new IllegalStateException("превышен лимит токенов");
+        }
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            log.warn("Wordstat request failed. Response status: {}, body: {}", response.statusCode(), response.body());
+            throw new IllegalStateException("Ошибка Wordstat API: HTTP " + response.statusCode());
+        }
         return objectMapper.readValue(response.body(), UniResponse.class);
+    }
+
+    private String buildAuthorizationHeader() {
+        String authToken = accessConfigs.getAuthToken() == null ? "" : accessConfigs.getAuthToken().trim();
+        if (authToken.isBlank()) {
+            throw new IllegalStateException(
+                    "Токен Wordstat API не задан. Укажите токен в настройках или через переменную окружения YANDEX_AUTH_TOKEN."
+            );
+        }
+        if (authToken.toLowerCase().startsWith("bearer ")) {
+            return authToken;
+        }
+        return "Bearer " + authToken;
+    }
+
+    private boolean isQuotaLimitExceeded(String responseBody) {
+        return responseBody != null && responseBody.toLowerCase().contains("quota limit exceeded");
+    }
+
+    private synchronized void registerWordStatRequest() {
+        resetRequestCounterIfNeeded();
+        if (requestsSentToday >= dailyRequestLimit) {
+            throw new IllegalStateException(
+                    "Дневной лимит запросов Wordstat исчерпан: " + requestsSentToday + " из " + dailyRequestLimit + "."
+            );
+        }
+        requestsSentToday++;
+        saveRequestCounterState();
+    }
+
+    private synchronized void exhaustDailyRequestLimit() {
+        resetRequestCounterIfNeeded();
+        requestsSentToday = dailyRequestLimit;
+        saveRequestCounterState();
+    }
+
+    private void resetRequestCounterIfNeeded() {
+        LocalDate today = LocalDate.now();
+        if (!today.equals(requestCounterDate)) {
+            requestCounterDate = today;
+            requestsSentToday = 0;
+            saveRequestCounterState();
+        }
+    }
+
+    private void scheduleDailyRequestCounterReset() {
+        long initialDelayMillis = Duration.between(
+                LocalDateTime.now(),
+                LocalDate.now().plusDays(1).atStartOfDay()
+        ).toMillis();
+        requestCounterResetExecutor.scheduleAtFixedRate(
+                this::resetRequestCounterAtMidnight,
+                Math.max(1L, initialDelayMillis),
+                Duration.ofDays(1).toMillis(),
+                TimeUnit.MILLISECONDS
+        );
+    }
+
+    private synchronized void resetRequestCounterAtMidnight() {
+        requestCounterDate = LocalDate.now();
+        requestsSentToday = 0;
+        saveRequestCounterState();
+    }
+
+    private synchronized void loadRequestCounterState() {
+        if (!Files.exists(requestCounterStatePath)) {
+            saveRequestCounterState();
+            return;
+        }
+
+        Properties properties = new Properties();
+        try (InputStream inputStream = Files.newInputStream(requestCounterStatePath)) {
+            properties.load(inputStream);
+            requestCounterDate = LocalDate.parse(
+                    properties.getProperty(COUNTER_DATE_PROPERTY, LocalDate.now().toString())
+            );
+            dailyRequestLimit = parsePositiveInteger(
+                    properties.getProperty(DAILY_REQUEST_LIMIT_PROPERTY),
+                    dailyRequestLimit
+            );
+            requestsSentToday = Math.max(
+                    0,
+                    parsePositiveInteger(properties.getProperty(REQUESTS_SENT_TODAY_PROPERTY), requestsSentToday)
+            );
+            resetRequestCounterIfNeeded();
+        } catch (RuntimeException | IOException exception) {
+            log.warn("Не удалось прочитать сохраненный счетчик запросов Wordstat, используем значения по умолчанию", exception);
+            requestCounterDate = LocalDate.now();
+            dailyRequestLimit = 1000;
+            requestsSentToday = 0;
+            saveRequestCounterState();
+        }
+    }
+
+    private synchronized void saveRequestCounterState() {
+        Properties properties = new Properties();
+        properties.setProperty(COUNTER_DATE_PROPERTY, requestCounterDate.toString());
+        properties.setProperty(DAILY_REQUEST_LIMIT_PROPERTY, String.valueOf(dailyRequestLimit));
+        properties.setProperty(REQUESTS_SENT_TODAY_PROPERTY, String.valueOf(requestsSentToday));
+
+        try {
+            Files.createDirectories(requestCounterStatePath.getParent());
+            try (OutputStream outputStream = Files.newOutputStream(requestCounterStatePath)) {
+                properties.store(outputStream, "Wordstat request counter state");
+            }
+        } catch (IOException exception) {
+            log.warn("Не удалось сохранить счетчик запросов Wordstat", exception);
+        }
+    }
+
+    private int parsePositiveInteger(String value, int fallback) {
+        if (value == null || value.trim().isBlank()) {
+            return fallback;
+        }
+
+        try {
+            int parsedValue = Integer.parseInt(value.trim());
+            return parsedValue < 1 ? fallback : parsedValue;
+        } catch (NumberFormatException exception) {
+            return fallback;
+        }
     }
 
     private ResponseToSaveToExcelDTO buildResponseDto(String universityName,
@@ -242,9 +453,31 @@ public class RequestService {
             }
 
             ExcelPreviewUniversity university = new ExcelPreviewUniversity();
+            university.setSheetName(sheet.getSheetName());
+            university.setHeaderRowIndex(headerRowIndex);
             university.setRowIndex(rowIndex);
             university.setFullNameColumnIndex(fullNameColumn);
             university.setUniversityName(universityName);
+
+            Integer firstPhraseColumn = phraseColumns.keySet().stream().findFirst().orElse(null);
+            for (Map.Entry<Integer, String> resultEntry : resultColumns.entrySet()) {
+                int resultColumn = resultEntry.getKey();
+                if (resultColumn <= fullNameColumn) {
+                    continue;
+                }
+                if (firstPhraseColumn != null && resultColumn >= firstPhraseColumn) {
+                    break;
+                }
+
+                String rawValue = formatter.formatCellValue(row.getCell(resultColumn)).trim();
+                ExcelPreviewResult previewResult = new ExcelPreviewResult();
+                previewResult.setColumnIndex(resultColumn);
+                previewResult.setDate(resultEntry.getValue());
+                previewResult.setMonthFrom(extractMonthFromDateRange(resultEntry.getValue(), true));
+                previewResult.setMonthTo(extractMonthFromDateRange(resultEntry.getValue(), false));
+                previewResult.setCountSum(parseInteger(rawValue));
+                university.getFullNameResults().add(previewResult);
+            }
 
             for (Integer phraseColumn : phraseColumns.keySet()) {
                 String phrase = formatter.formatCellValue(row.getCell(phraseColumn)).trim();
@@ -284,7 +517,7 @@ public class RequestService {
                 }
             }
 
-            if (!university.getBlocks().isEmpty()) {
+            if (!university.getBlocks().isEmpty() || !university.getFullNameResults().isEmpty()) {
                 previewSheet.getUniversities().add(university);
             }
         }
